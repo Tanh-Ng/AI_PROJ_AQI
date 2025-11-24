@@ -146,7 +146,7 @@ if st.sidebar.button("Chạy Dự Báo"):
                     # Vẽ bản đồ đã được mask
                     im = ax.imshow(aqi_map_masked, cmap=cmap, norm=norm)
                     ax.axis('off')
-                    ax.set_title(f"Bản đồ AQI (Đã tách nền) - {input_date}")
+                    ax.set_title(f"Bản đồ AQI - {input_date}")
                     st.pyplot(fig)
                 
                 with col2:
