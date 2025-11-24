@@ -84,25 +84,35 @@ if st.sidebar.button("Chạy Dự Báo"):
     else:
         with st.spinner("Đang tính toán..."):
             try:
-                # 1. Đọc dữ liệu
+                # 1. Đọc dữ liệu & TẠO MASK
                 layers = []
+                with rasterio.open(dem_path) as src:
+                    dem_raw = src.read(1)
+                  
+                    mask = (dem_raw == src.nodata) | np.isnan(dem_raw)
+                    
+                    layers.append(np.nan_to_num(dem_raw, nan=0.0))
+
+                # Đọc các file khí tượng
                 meteo_vars = ['PRES2M', 'RH', 'WSPD', 'TMP', 'TP']
                 for var in meteo_vars:
                     f_name = [f for f in os.listdir(day_folder) if f.startswith(var) and f.endswith('.tif')]
                     if not f_name: st.error(f"Thiếu {var}"); st.stop()
                     with rasterio.open(os.path.join(day_folder, f_name[0])) as src:
-                        layers.append(np.nan_to_num(src.read(1), nan=0.0))
+                        data = src.read(1)
+                        mask = mask | (data == src.nodata) | np.isnan(data)
+                        layers.append(np.nan_to_num(data, nan=0.0))
                 
-                with rasterio.open(dem_path) as src:
-                    layers.append(np.nan_to_num(src.read(1), nan=0.0))
-                
-                # 2. Xử lý & Dự báo
-                stack = np.dstack(layers)
+                # Sắp xếp lại layer cho đúng thứ tự model yêu cầu
+                # Model cần: [PRES2M, RH, WSPD, TMP, TP, SQRT_SEA_DEM_LAT]
+
+                ordered_layers = layers[1:] + [layers[0]]
+
+                # 2. Stack & Predict
+                stack = np.dstack(ordered_layers)
                 rows, cols, _ = stack.shape
                 X_flat = stack.reshape(-1, 6)
                 
-                # Scale & Predict
-                # Tạo tên cột giả để scaler không báo lỗi
                 cols_name = ['PRES2M', 'RH', 'WSPD', 'TMP', 'TP', 'SQRT_SEA_DEM_LAT']
                 X_scaled = scaler.transform(pd.DataFrame(X_flat, columns=cols_name))
                 
@@ -111,18 +121,19 @@ if st.sidebar.button("Chạy Dự Báo"):
                     _, predicted = torch.max(outputs, 1)
                 
                 aqi_map = predicted.numpy().reshape(rows, cols)
+
+                # 3. ÁP DỤNG MASK VÀO KẾT QUẢ
+                # Biến các vùng mask thành "invalid" để matplotlib không vẽ màu
+                aqi_map_masked = np.ma.masked_where(mask, aqi_map)
                 
-                # 3. TẠO BẢNG MÀU ĐỘNG (DYNAMIC COLORMAP)
+                # 4. HIỂN THỊ
                 classes = label_encoder.classes_ 
-                
-                # Tạo list màu tương ứng với từng lớp
-                map_colors = []
-                for c in classes:
-                    # Lấy màu từ từ điển, nếu không có thì để màu xám
-                    color = AQI_COLORS.get(str(c).strip(), "#808080")
-                    map_colors.append(color)
+                map_colors = [AQI_COLORS.get(str(c).strip(), "#808080") for c in classes]
                 
                 cmap = ListedColormap(map_colors)
+                # Quan trọng: Đặt màu cho vùng bị che (bad/masked) là trong suốt
+                cmap.set_bad(color='white', alpha=0) 
+                
                 bounds = np.arange(len(classes) + 1) - 0.5
                 norm = BoundaryNorm(bounds, cmap.N)
 
@@ -130,27 +141,21 @@ if st.sidebar.button("Chạy Dự Báo"):
                 st.success("Dự báo hoàn tất!")
                 
                 col1, col2 = st.columns([3, 1])
-                
                 with col1:
                     fig, ax = plt.subplots(figsize=(8, 6))
-                    # Vẽ bản đồ với bảng màu đã chuẩn hóa
-                    im = ax.imshow(aqi_map, cmap=cmap, norm=norm)
+                    # Vẽ bản đồ đã được mask
+                    im = ax.imshow(aqi_map_masked, cmap=cmap, norm=norm)
                     ax.axis('off')
-                    ax.set_title(f"Bản đồ phân vùng AQI ngày {input_date}")
+                    ax.set_title(f"Bản đồ AQI (Đã tách nền) - {input_date}")
                     st.pyplot(fig)
                 
                 with col2:
                     st.subheader("Chú thích")
                     for i, c in enumerate(classes):
-                        color = map_colors[i]
-                        # Hiển thị ô màu + Tên lớp
                         st.markdown(
-                            f"""
-                            <div style="display: flex; align-items: center; margin-bottom: 5px;">
-                                <div style="width: 20px; height: 20px; background-color: {color}; margin-right: 10px; border: 1px solid #ccc;"></div>
-                                <span style="font-size: 16px;">{c}</span>
-                            </div>
-                            """, 
+                            f"""<div style="display: flex; align-items: center; margin-bottom: 5px;">
+                                <div style="width: 20px; height: 20px; background-color: {map_colors[i]}; margin-right: 10px; border: 1px solid #ccc;"></div>
+                                <span>{c}</span></div>""", 
                             unsafe_allow_html=True
                         )
 
