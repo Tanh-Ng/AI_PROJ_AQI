@@ -14,7 +14,7 @@ DATA_ROOT = 'data_raw'
 MODEL_DIR = 'models'
 
 st.set_page_config(page_title="AQI Visualizer", layout="wide")
-st.title("Visualizer Dự Báo AQI")
+st.title("Hệ thống Dự báo Chất lượng Không khí (AQI)")
 
 # --- 2. ĐỊNH NGHĨA MODEL ---
 class AQIClassifier(nn.Module):
@@ -38,7 +38,57 @@ class AQIClassifier(nn.Module):
         out = self.fc4(out)
         return out
 
-# --- 3. LOAD ARTIFACTS ---
+# --- 3. CÁC HÀM HỖ TRỢ QUAN TRỌNG ---
+
+def scan_data_structure(root_dir):
+    """Quét cấu trúc thư mục Năm/Tháng/Ngày để tạo menu"""
+    structure = {}
+    if not os.path.exists(root_dir): return structure
+
+    for year in sorted(os.listdir(root_dir)):
+        year_path = os.path.join(root_dir, year)
+        if not os.path.isdir(year_path): continue
+        
+        year_data = {}
+        for month in sorted(os.listdir(year_path)):
+            month_path = os.path.join(year_path, month)
+            if not os.path.isdir(month_path): continue
+            
+            valid_days = []
+            for day in sorted(os.listdir(month_path)):
+                day_path = os.path.join(month_path, day)
+                if not os.path.isdir(day_path): continue
+                if any(f.endswith('.tif') for f in os.listdir(day_path)):
+                    valid_days.append(day)
+            
+            if valid_days:
+                year_data[month] = valid_days
+        
+        if year_data:
+            structure[year] = year_data
+            
+    return structure
+
+def get_aqi_color(label_name):
+    name_clean = str(label_name).strip().lower()
+    
+    # Danh sách ưu tiên: (Từ khóa, Mã màu)
+    priority_map = [
+        ("nguy hại", "#7E0023"),  # Nâu (Check trước tiên)
+        ("rất xấu", "#8F3F97"),   # Tím (Check trước Xấu)
+        ("xấu", "#FF0000"),       # Đỏ
+        ("kém", "#FF7E00"),       # Cam
+        ("trung bình", "#FFFF00"),# Vàng
+        ("tốt", "#00E400")        # Xanh
+    ]
+    
+    for key, color in priority_map:
+        if key in name_clean:
+            return color
+            
+    return "#808080" # Màu xám nếu không tìm thấy
+
+# --- 4. LOAD ARTIFACTS ---
 @st.cache_resource
 def load_artifacts():
     try:
@@ -57,58 +107,66 @@ def load_artifacts():
 
 model, scaler, label_encoder = load_artifacts()
 
-# --- 4. CẤU HÌNH MÀU SẮC CHUẨN AQI ---
-AQI_COLORS = {
-    "Tốt": "#00E400",       # Xanh lá
-    "Trung bình": "#FFFF00",# Vàng
-    "Kém": "#FF7E00",       # Cam
-    "Xấu": "#FF0000",       # Đỏ
-    "Rất xấu": "#8F3F97",   # Tím
-    "Nguy hại": "#7E0023"   # Nâu đỏ
-}
+# --- 5. GIAO DIỆN CHỌN NGÀY (MENU DROPDOWN) ---
+st.sidebar.header("Chọn Thời Gian")
 
-# --- 5. GIAO DIỆN ---
-st.sidebar.header("Tùy Chọn")
-input_date = st.sidebar.text_input("Nhập ngày (YYYYMMDD):", "20200101")
+data_tree = scan_data_structure(DATA_ROOT)
 
+if not data_tree:
+    st.sidebar.error(f"Không tìm thấy dữ liệu trong '{DATA_ROOT}'")
+    st.stop()
+
+# Chọn Năm
+years = list(data_tree.keys())
+sel_year = st.sidebar.selectbox("Năm", years)
+
+# Chọn Tháng
+months = list(data_tree[sel_year].keys())
+sel_month = st.sidebar.selectbox("Tháng", months)
+
+# Chọn Ngày
+days = data_tree[sel_year][sel_month]
+sel_day = st.sidebar.selectbox("Ngày", days)
+
+# Hiển thị thông báo
+st.sidebar.success(f"Đã chọn: {sel_day}/{sel_month}/{sel_year}")
+
+# --- 6. XỬ LÝ CHÍNH ---
 if st.sidebar.button("Chạy Dự Báo"):
     if not model: st.stop()
     
-    # Tạo đường dẫn
-    year, month, day = input_date[:4], input_date[4:6], input_date[6:8]
-    day_folder = os.path.join(DATA_ROOT, year, month, day)
+    # Tạo đường dẫn từ menu đã chọn
+    day_folder = os.path.join(DATA_ROOT, sel_year, sel_month, sel_day)
     dem_path = os.path.join(DATA_ROOT, "SQRT_SEA_DEM_LAT.tif")
     
     if not os.path.exists(day_folder) or not os.path.exists(dem_path):
-        st.error(f"Không tìm thấy dữ liệu ngày {input_date} hoặc file địa hình.")
+        st.error(f"Lỗi đường dẫn dữ liệu: {day_folder}")
     else:
-        with st.spinner("Đang tính toán..."):
+        with st.spinner("Đang xử lý dữ liệu vệ tinh..."):
             try:
-                # 1. Đọc dữ liệu & TẠO MASK
                 layers = []
+                
+                # 1. Đọc DEM trước để lấy Mask
                 with rasterio.open(dem_path) as src:
                     dem_raw = src.read(1)
-                  
                     mask = (dem_raw == src.nodata) | np.isnan(dem_raw)
-                    
                     layers.append(np.nan_to_num(dem_raw, nan=0.0))
 
-                # Đọc các file khí tượng
+                # 2. Đọc khí tượng
                 meteo_vars = ['PRES2M', 'RH', 'WSPD', 'TMP', 'TP']
                 for var in meteo_vars:
                     f_name = [f for f in os.listdir(day_folder) if f.startswith(var) and f.endswith('.tif')]
-                    if not f_name: st.error(f"Thiếu {var}"); st.stop()
+                    if not f_name: st.error(f"Thiếu file: {var}"); st.stop()
+                    
                     with rasterio.open(os.path.join(day_folder, f_name[0])) as src:
                         data = src.read(1)
                         mask = mask | (data == src.nodata) | np.isnan(data)
                         layers.append(np.nan_to_num(data, nan=0.0))
                 
-                # Sắp xếp lại layer cho đúng thứ tự model yêu cầu
-                # Model cần: [PRES2M, RH, WSPD, TMP, TP, SQRT_SEA_DEM_LAT]
-
+                # 3. Sắp xếp layer: [PRES, RH, WSPD, TMP, TP, DEM]
                 ordered_layers = layers[1:] + [layers[0]]
 
-                # 2. Stack & Predict
+                # 4. Dự báo
                 stack = np.dstack(ordered_layers)
                 rows, cols, _ = stack.shape
                 X_flat = stack.reshape(-1, 6)
@@ -121,43 +179,45 @@ if st.sidebar.button("Chạy Dự Báo"):
                     _, predicted = torch.max(outputs, 1)
                 
                 aqi_map = predicted.numpy().reshape(rows, cols)
-
-                # 3. ÁP DỤNG MASK VÀO KẾT QUẢ
-                # Biến các vùng mask thành "invalid" để matplotlib không vẽ màu
                 aqi_map_masked = np.ma.masked_where(mask, aqi_map)
                 
-                # 4. HIỂN THỊ
+                # 5. Xử lý màu sắc (CHUẨN HÓA)
                 classes = label_encoder.classes_ 
-                map_colors = [AQI_COLORS.get(str(c).strip(), "#808080") for c in classes]
+                map_colors = []
+                
+                # Duyệt qua từng lớp và tìm màu đúng chuẩn
+                for c in classes:
+                    color = get_aqi_color(c)
+                    map_colors.append(color)
                 
                 cmap = ListedColormap(map_colors)
-                # Quan trọng: Đặt màu cho vùng bị che (bad/masked) là trong suốt
                 cmap.set_bad(color='white', alpha=0) 
                 
                 bounds = np.arange(len(classes) + 1) - 0.5
                 norm = BoundaryNorm(bounds, cmap.N)
 
-                # 4. HIỂN THỊ KẾT QUẢ
-                st.success("Dự báo hoàn tất!")
+                # 6. Hiển thị Kết quả
+                st.success("Dự báo hoàn tất")
                 
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     fig, ax = plt.subplots(figsize=(8, 6))
-                    # Vẽ bản đồ đã được mask
                     im = ax.imshow(aqi_map_masked, cmap=cmap, norm=norm)
                     ax.axis('off')
-                    ax.set_title(f"Bản đồ AQI - {input_date}")
+                    ax.set_title(f"Bản đồ AQI - {sel_day}/{sel_month}/{sel_year}")
                     st.pyplot(fig)
                 
                 with col2:
                     st.subheader("Chú thích")
+                    # Hiển thị bảng chú thích với màu chuẩn đã map
                     for i, c in enumerate(classes):
+                        color = map_colors[i]
                         st.markdown(
-                            f"""<div style="display: flex; align-items: center; margin-bottom: 5px;">
-                                <div style="width: 20px; height: 20px; background-color: {map_colors[i]}; margin-right: 10px; border: 1px solid #ccc;"></div>
-                                <span>{c}</span></div>""", 
+                            f"""<div style="display: flex; align-items: center; margin-bottom: 8px;">
+                                <div style="width: 24px; height: 24px; background-color: {color}; margin-right: 12px; border: 1px solid #ccc; border-radius: 4px;"></div>
+                                <span style="font-size: 16px;">{c}</span></div>""", 
                             unsafe_allow_html=True
                         )
 
             except Exception as e:
-                st.error(f"Lỗi: {e}")
+                st.error(f"Lỗi chi tiết: {e}")
