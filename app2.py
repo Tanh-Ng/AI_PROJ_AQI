@@ -5,17 +5,65 @@ import rasterio
 import joblib
 import os
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, BoundaryNorm
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import xgboost
 
 # --- 1. CẤU HÌNH ---
 DATA_ROOT = 'data_raw'
 MODEL_DIR = 'models'
 
-st.set_page_config(page_title="Pro AQI Visualizer", layout="wide")
-st.title("Visualizer AQI")
+st.set_page_config(page_title="AQI Visualizer VN", layout="wide")
+st.title("Chất Lượng Không Khí Hà Nội")
 
-# --- 2. HÀM HỖ TRỢ ---
+# --- 2. CÔNG THỨC TÍNH AQI ---
+def calculate_aqi_scalar(pm25):
+    """
+    AQI = [ (I_hi - I_lo) / (BP_hi - BP_lo) ] * (Cx - BP_lo) + I_lo
+    """
+    # Bảng 1: Quy định giá trị BP và I 
+    # Cấu trúc: (BP_lo, BP_hi, I_lo, I_hi)
+    breakpoints = [
+        (0, 25, 0, 50),         # Mức 1
+        (25, 50, 50, 100),      # Mức 2
+        (50, 80, 100, 150),     # Mức 3
+        (80, 150, 150, 200),    # Mức 4
+        (150, 250, 200, 300),   # Mức 5
+        (250, 350, 300, 400),   # Mức 6
+        (350, 500, 400, 500)    # Mức 7
+    ]
+    
+    Cx = float(pm25) # Nồng độ đầu vào (C_x)
+    
+    # Xử lý ngoại lệ (Ngoài khoảng đo)
+    if Cx < 0: return 0
+    if Cx > 500: return 500 # Kịch kim bảng tra
+    
+    for bp in breakpoints:
+        BP_lo, BP_hi, I_lo, I_hi = bp
+        
+        # Kiểm tra xem Cx thuộc khoảng nào [BP_i, BP_i+1]
+        if BP_lo <= Cx <= BP_hi:
+            # Áp dụng ĐÚNG công thức trong ảnh:
+            # (I_i+1 - I_i)
+            tu_so = I_hi - I_lo
+            
+            # (BP_i+1 - BP_i)
+            mau_so = BP_hi - BP_lo
+            
+            # (Cx - BP_i)
+            hieu_so = Cx - BP_lo
+            
+            # Công thức tổng quát
+            aqi = (tu_so / mau_so) * hieu_so + I_lo
+            
+            return aqi
+            
+    return 0
+
+# Vectorize để chạy nhanh trên ma trận
+v_calculate_aqi = np.vectorize(calculate_aqi_scalar)
+
+# --- 3. HÀM HỖ TRỢ ---
 def scan_data_structure(root_dir):
     structure = {}
     if not os.path.exists(root_dir): return structure
@@ -32,27 +80,15 @@ def scan_data_structure(root_dir):
         if year_data: structure[year] = year_data
     return structure
 
-# Dải màu Gradient nhiệt (Jet style) để nhìn rõ biến động
-def get_heatmap_cmap():
-    # Xanh (Sạch) -> Vàng -> Cam -> Đỏ -> Tím -> Đen (Bẩn)
-    colors = ["#00008B", "#00BFFF", "#00FF00", "#FFFF00", "#FF7F50", "#FF0000", "#8B0000"]
-    return LinearSegmentedColormap.from_list("custom_heat", colors, N=256)
-
-# --- 3. GIAO DIỆN CẤU HÌNH ---
+# --- 4. GIAO DIỆN ---
 st.sidebar.header("Cấu Hình")
 
-# A. Chọn Model
-ml_models = [f for f in os.listdir(MODEL_DIR) if '_reg.pkl' in f or '_log.pkl' in f]
-if not ml_models:
-    st.error("Chưa có model Hồi quy! Chạy 'python train_reg.py'.")
-    st.stop()
+ml_models = [f for f in os.listdir(MODEL_DIR) if '_reg.pkl' in f]
+if not ml_models: st.error("Chưa có model Regression!"); st.stop()
+selected_model_file = st.sidebar.selectbox("Chọn Model:", ml_models)
 
-selected_model_file = st.sidebar.selectbox("Chọn Model:", ml_models, index=len(ml_models)-1)
-
-# B. Chọn Ngày
 data_tree = scan_data_structure(DATA_ROOT)
 if not data_tree: st.error("Không tìm thấy data!"); st.stop()
-
 years = list(data_tree.keys())
 sel_year = st.sidebar.selectbox("Năm", years)
 months = list(data_tree[sel_year].keys())
@@ -60,90 +96,87 @@ sel_month = st.sidebar.selectbox("Tháng", months)
 days = data_tree[sel_year][sel_month]
 sel_day = st.sidebar.selectbox("Ngày", days)
 
-st.sidebar.markdown("---")
-# C. TÙY CHỌN HIỂN THỊ (TÍNH NĂNG MỚI)
-st.sidebar.subheader("Hiển Thị")
-use_auto_contrast = st.sidebar.checkbox("Tăng cường độ tương phản", value=True, help="Tự động co giãn màu sắc để làm rõ các biến động nhỏ nhất.")
-show_values = st.sidebar.checkbox("Hiển thị chú thích số liệu", value=True)
+view_mode = st.sidebar.radio("Hiển thị:", ["Chỉ số AQI", "Nồng độ PM2.5"])
 
-# --- 4. XỬ LÝ CHÍNH ---
+# --- 5. XỬ LÝ CHÍNH ---
 if st.sidebar.button("Chạy Dự Báo"):
     model_path = os.path.join(MODEL_DIR, selected_model_file)
-    with st.spinner(f"Đang tải {selected_model_file}..."):
+    with st.spinner(f"Đang chạy mô hình..."):
         model = joblib.load(model_path)
 
     day_folder = os.path.join(DATA_ROOT, sel_year, sel_month, sel_day)
     dem_path = os.path.join(DATA_ROOT, "SQRT_SEA_DEM_LAT.tif")
     
-    if not os.path.exists(day_folder): st.error("Lỗi đường dẫn data"); st.stop()
-
-    with st.spinner("Đang tính toán heatmap..."):
+    with st.spinner("Đang tính toán..."):
         try:
             layers = []
-            # 1. Đọc DEM
             with rasterio.open(dem_path) as src:
                 dem_raw = src.read(1)
                 mask = (dem_raw == src.nodata) | np.isnan(dem_raw)
                 layers.append(np.nan_to_num(dem_raw, nan=0.0))
             
-            # 2. Đọc Khí tượng
             for var in ['PRES2M', 'RH', 'WSPD', 'TMP', 'TP']:
                 f = [x for x in os.listdir(day_folder) if x.startswith(var)][0]
                 with rasterio.open(os.path.join(day_folder, f)) as src:
-                    data = src.read(1)
-                    mask = mask | (data == src.nodata) | np.isnan(data)
-                    layers.append(np.nan_to_num(data, nan=0.0))
+                    layers.append(np.nan_to_num(src.read(1), nan=0.0))
             
-            # 3. Predict
+            # Predict
             stack = np.dstack(layers[1:] + [layers[0]])
             rows, cols, _ = stack.shape
-            X_df = pd.DataFrame(stack.reshape(-1, 6), columns=['PRES2M', 'RH', 'WSPD', 'TMP', 'TP', 'SQRT_SEA_DEM_LAT'])
+            pm25_pred = model.predict(stack.reshape(-1, 6)).reshape(rows, cols)
             
-            pred_raw = model.predict(X_df)
+            # Tính AQI chuẩn xác
+            aqi_pred = v_calculate_aqi(pm25_pred)
             
-            # Xử lý nếu là model Log
-            if "_log" in selected_model_file:
-                pred_real = np.expm1(pred_raw)
-            else:
-                pred_real = pred_raw
-            
-            # 4. Xử lý Hiển thị (Auto Contrast Logic)
-            pm25_map = pred_real.reshape(rows, cols)
-            map_masked = np.ma.masked_where(mask, pm25_map)
-            
-            # Tính toán min/max cho màu sắc
-            if use_auto_contrast:
-                valid_data = pm25_map[~mask]
-                vmin = np.percentile(valid_data, 2)
-                vmax = np.percentile(valid_data, 98)
-            else:
-                # Dùng chuẩn cố định (0 - 300)
-                vmin = 0
-                vmax = 300
-            
-            st.success(f"Kết quả ({selected_model_file})")
-            
+            st.success(f"Kết quả ngày {sel_day}/{sel_month}/{sel_year}")
             col1, col2 = st.columns([3, 1])
+            
             with col1:
                 fig, ax = plt.subplots(figsize=(10, 8))
-                cmap = get_heatmap_cmap()
-                cmap.set_bad(color='white', alpha=0)
                 
-                im = ax.imshow(map_masked, cmap=cmap, vmin=vmin, vmax=vmax)
-                ax.axis('off')
-                ax.set_title(f"Bản đồ nồng độ PM2.5 ngày {sel_day}/{sel_month}/{sel_year}", fontsize=16)
+                if "AQI" in view_mode:
+                    data_to_plot = aqi_pred
+                    title = "Chỉ số AQI (0-500)"
+                    
+                    # BẢNG MÀU 5 CẤP (Gộp >200 thành Tím)
+                    colors = ["#00E400", "#FFFF00", "#FF7E00", "#FF0000", "#8F3F97"]
+                    cmap = ListedColormap(colors)
+                    
+                    # Bounds: Tô màu Tím cho tất cả giá trị từ 200 đến 500
+                    bounds = [0, 50, 100, 150, 200, 500] 
+                    norm = BoundaryNorm(bounds, cmap.N)
+                else:
+                    data_to_plot = pm25_pred
+                    title = "Nồng độ Bụi PM2.5 (µg/m³)"
+                    cmap = plt.get_cmap("jet")
+                    norm = None
+
+                map_masked = np.ma.masked_where(mask, data_to_plot)
+                cmap.set_bad('white', 0)
                 
-                if show_values:
-                    cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
-                    cbar.set_label('PM2.5 (µg/m³)')
+                im = ax.imshow(map_masked, cmap=cmap, norm=norm)
+                ax.axis('off'); ax.set_title(title)
+                
+                cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+                if "AQI" in view_mode:
+                    cbar.set_ticks([25, 75, 125, 175, 350])
+                    cbar.set_ticklabels(["Tốt", "TB", "Kém", "Xấu", "Rất xấu"])
                 
                 st.pyplot(fig)
-            
-            with col2:
-                st.info("**Thống kê ngày:**")
-                st.metric("Thấp nhất", f"{np.min(pred_real):.1f}")
-                st.metric("Cao nhất", f"{np.max(pred_real):.1f}")
-                st.metric("Trung bình", f"{np.mean(pred_real):.1f}")
                 
-                st.write("---")
+            with col2:
+                if "AQI" in view_mode:
+                    st.write("**Thang đo:**")
+                    st.markdown("🟢 **0-50:** Tốt")
+                    st.markdown("🟡 **51-100:** Trung bình")
+                    st.markdown("🟠 **101-150:** Kém")
+                    st.markdown("🔴 **151-200:** Xấu")
+                    st.markdown("🟣 **>200:** Rất xấu")
+                    
+                    st.info(f"Max AQI: {np.max(aqi_pred):.1f}")
+                    st.info(f"Min AQI: {np.min(aqi_pred):.1f}")
+                else:
+                    st.metric("Max PM2.5", f"{np.max(pm25_pred):.1f}")
+                    st.metric("Min PM2.5", f"{np.min(pm25_pred):.1f}")
+
         except Exception as e: st.error(f"Lỗi: {e}")
